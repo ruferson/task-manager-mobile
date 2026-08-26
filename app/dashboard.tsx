@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useState } from "react";
 import {
   ActivityIndicator,
+  DeviceEventEmitter,
   FlatList,
   KeyboardAvoidingView,
   Platform,
@@ -16,6 +17,7 @@ import { io, Socket } from "socket.io-client";
 import axios from "axios";
 import { api } from "../src/lib/api";
 import { colors, radii, spacing } from "../src/theme";
+import { AnalyticsWidget } from "../src/components/AnalyticsWidget";
 
 const SOCKET_URL = "http://192.168.0.105:3001";
 
@@ -74,11 +76,11 @@ export default function DashboardScreen() {
           `/projects?page=${pageNumber}&limit=4&sortBy=${sortBy}&order=${order}`,
         );
 
-        if (pageNumber === 1) {
-          setProjects(response.data.data);
-        } else {
-          setProjects((prev) => [...prev, ...response.data.data]);
-        }
+        setProjects((prev) =>
+          pageNumber === 1
+            ? response.data.data
+            : [...prev, ...response.data.data],
+        );
         setHasMore(response.data.hasMore);
       } catch (error: unknown) {
         if (axios.isAxiosError(error) && error.response?.status === 401) {
@@ -107,12 +109,8 @@ export default function DashboardScreen() {
       setProjects((current) =>
         current.map((project) => {
           if (project.id === newTask.projectId) {
-            const exists = project.tasks.some((t) => t.id === newTask.id);
-            if (exists) return project;
-            return {
-              ...project,
-              tasks: [...project.tasks, newTask],
-            };
+            if (project.tasks.some((t) => t.id === newTask.id)) return project;
+            return { ...project, tasks: [...project.tasks, newTask] };
           }
           return project;
         }),
@@ -121,17 +119,16 @@ export default function DashboardScreen() {
 
     socket.on("taskUpdated", (updatedTask: Task) => {
       setProjects((current) =>
-        current.map((project) => {
-          if (project.id === updatedTask.projectId) {
-            return {
-              ...project,
-              tasks: project.tasks.map((task) =>
-                task.id === updatedTask.id ? updatedTask : task,
-              ),
-            };
-          }
-          return project;
-        }),
+        current.map((project) =>
+          project.id === updatedTask.projectId
+            ? {
+                ...project,
+                tasks: project.tasks.map((task) =>
+                  task.id === updatedTask.id ? updatedTask : task,
+                ),
+              }
+            : project,
+        ),
       );
     });
 
@@ -139,33 +136,36 @@ export default function DashboardScreen() {
       "taskDeleted",
       (deletedTask: { id: string; projectId: string }) => {
         setProjects((current) =>
-          current.map((project) => {
-            if (project.id === deletedTask.projectId) {
-              return {
-                ...project,
-                tasks: project.tasks.filter(
-                  (task) => task.id !== deletedTask.id,
-                ),
-              };
-            }
-            return project;
-          }),
+          current.map((project) =>
+            project.id === deletedTask.projectId
+              ? {
+                  ...project,
+                  tasks: project.tasks.filter(
+                    (task) => task.id !== deletedTask.id,
+                  ),
+                }
+              : project,
+          ),
         );
       },
     );
 
     socket.on("projectCreated", (newProject: Project) => {
-      setProjects((current) => {
-        const exists = current.some((p) => p.id === newProject.id);
-        if (exists) return current;
-        return [newProject, ...current];
-      });
+      setProjects((current) =>
+        current.some((p) => p.id === newProject.id)
+          ? current
+          : [newProject, ...current],
+      );
     });
 
     socket.on("projectDeleted", (deletedProject: { id: string }) => {
       setProjects((current) =>
         current.filter((project) => project.id !== deletedProject.id),
       );
+    });
+
+    socket.on("analyticsUpdated", (updatedAnalytics) => {
+      DeviceEventEmitter.emit("analyticsUpdatedEvent", updatedAnalytics);
     });
 
     return () => {
@@ -188,7 +188,6 @@ export default function DashboardScreen() {
 
   const handleLoadMore = () => {
     if (!hasMore || loadingMore) return;
-    setLoadingMore(true);
     const nextPage = page + 1;
     setPage(nextPage);
     fetchProjects(nextPage, sortOption);
@@ -227,10 +226,32 @@ export default function DashboardScreen() {
   const handleStatusChange = async (taskId: string, status: Task["status"]) => {
     const nextStatus = NEXT_STATUS[status];
     setUpdatingTask(taskId);
+
+    const targetProject = projects.find((p) =>
+      p.tasks.some((t) => t.id === taskId),
+    );
+
+    if (targetProject) {
+      DeviceEventEmitter.emit("analyticsLoadingEvent", {
+        projectId: targetProject.id,
+      });
+    }
+
+    // Actualización optimista de tareas
+    setProjects((current) =>
+      current.map((project) => ({
+        ...project,
+        tasks: project.tasks.map((task) =>
+          task.id === taskId ? { ...task, status: nextStatus } : task,
+        ),
+      })),
+    );
+
     try {
       await api.patch(`/tasks/${taskId}`, { status: nextStatus });
     } catch (error) {
       console.error("Failed to update task status:", error);
+      fetchProjects(1, sortOption);
     } finally {
       setUpdatingTask(null);
     }
@@ -281,7 +302,6 @@ export default function DashboardScreen() {
         </TouchableOpacity>
       </View>
 
-      {/* Selector de Ordenación Móvil */}
       <View style={styles.sortContainer}>
         <Text style={styles.sortLabel}>Orden:</Text>
         <TouchableOpacity
@@ -362,6 +382,12 @@ export default function DashboardScreen() {
               <Text style={styles.description}>
                 {project.description || "Sin descripción"}
               </Text>
+
+              <AnalyticsWidget
+                projectId={project.id}
+                tasksCount={project.tasks.length}
+              />
+
               <View style={styles.taskInputRow}>
                 <TextInput
                   style={[styles.input, styles.taskInput]}
@@ -382,10 +408,12 @@ export default function DashboardScreen() {
                   <Text style={styles.taskButtonText}>+ Tarea</Text>
                 </TouchableOpacity>
               </View>
+
               <View style={styles.divider} />
               <Text style={styles.tasksHeader}>
                 TAREAS ({project.tasks.length})
               </Text>
+
               {project.tasks.length === 0 ? (
                 <Text style={styles.emptyTasks}>Sin tareas asignadas</Text>
               ) : (
